@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
+const SERPER_TIMEOUT_MS = 1000;
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -11,6 +11,7 @@ const SYSTEM_PROMPT = [
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "На новостные и спорные темы отвечай по существу и нейтрально, опираясь на результаты поиска, если они есть.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -46,7 +47,11 @@ function fitAliceText(value) {
 }
 
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|что происходит|что случилось|расскажи про|беспилот|дрон/i.test(text);
+}
+
+function isExitIntent(text) {
+  return /^(пока|выход|хватит|стоп|закончить|до свидания)(?:$|[\s.,!?])/i.test(text.trim());
 }
 
 function safeHistory(history) {
@@ -218,10 +223,14 @@ export default async function handler(req, res) {
     ));
   }
 
+  if (isExitIntent(text)) {
+    return res.status(200).json(aliceResponse("Хорошо, до встречи!", true, []));
+  }
+
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
+      // Search has a short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
