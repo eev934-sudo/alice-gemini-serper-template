@@ -1,7 +1,7 @@
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Europe/Moscow";
 
 // Лимит Алисы для навыка — 4,5 с на всё (доставка запроса, работа, доставка ответа).
