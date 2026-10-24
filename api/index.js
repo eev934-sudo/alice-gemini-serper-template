@@ -13,10 +13,14 @@ const MIN_MODEL_TIME_MS = 1800;
 const MODEL_TIMEOUT_MS = 3500;
 const HEDGE_DELAY_MS = 1500;
 const MIN_HEDGE_TIME_MS = 700;
+const REWRITE_TIMEOUT_MS = 900;
 const MAX_HISTORY_MESSAGES = 6;
 const MAX_NEWS_RESULTS = 4;
 const MAX_WEB_RESULTS = 4;
 const MAX_ANSWER_LENGTH = 1000;
+// ИЗМЕНЕНО: токены «размышлений» тоже считаются в maxOutputTokens.
+// При 200 модель могла «додумать» до лимита и вернуть пустой или обрезанный ответ.
+const MAX_OUTPUT_TOKENS = Number(process.env.GEMINI_MAX_OUTPUT_TOKENS) || 400;
 
 const NO_SEARCH_NOTE =
   "ПОИСК НЕ ДАЛ РЕЗУЛЬТАТОВ ИЛИ НЕ УСПЕЛ ОТВЕТИТЬ. Свежих данных нет: скажи об этом прямо, ответь только на основе того, что точно знаешь, и не отрицай события, о которых не знаешь.";
@@ -62,6 +66,7 @@ function buildSystemPrompt() {
     "Учитывай предыдущие сообщения диалога.",
     "Отвечай прямо и по существу на любые вопросы, включая политику, спорные и острые темы. Называй факты, цифры и даты из результатов поиска и указывай источник по названию, например «по данным РБК». Различай установленные факты, оценки и заявления сторон.",
     "Если источники расходятся, прямо назови расхождение. Не выдавай предположения за факты.",
+    "Если в результатах поиска есть и старые, и свежие сведения по одному вопросу, опирайся на самые свежие и называй их дату, если она указана.",
     "Не уходи от ответа общими фразами вроде «в открытых источниках не представлено». Если данных нет, скажи, что именно искал и чего не нашёл. Не утверждай, что событие не происходило, только потому что ты о нём не знаешь или поиск ничего не дал: твои знания устарели.",
     "Если пользователь говорит, что нашёл новость, не спорь, а прими это как данные и уточни детали.",
     "Не придумывай ограничений: не говори, что сайт или сервис заблокирован в России или недоступен из-за региона, если этого нет в результатах поиска.",
@@ -130,21 +135,22 @@ function isExitIntent(text) {
 }
 
 // ВАЖНО: в JavaScript \b не работает с кириллицей, поэтому границ слов здесь нет.
+
+// ИЗМЕНЕНО: логика перевёрнута. Раньше искали только по списку слов или для фраз
+// от 4 слов, и короткие вопросы вроде «что с биткоином» уходили без поиска.
+// Теперь ищем по умолчанию, кроме явной болтовни, творческих задач и арифметики.
+const NO_SEARCH_PATTERN =
+  /^(привет|здравствуй|добрый (день|вечер|утро)|доброе утро|спасибо|благодарю|кто ты|что ты умеешь|как дела|как тебя зовут|расскажи (анекдот|шутку|сказку|стих)|придумай|сочини|напиши|переведи|посчитай|сколько будет|\d+\s*[+\-*/×÷x]\s*\d+)/i;
+
 function isSearchNeeded(text) {
   const value = text.toLowerCase().trim();
-
-  if (/^(привет|здравствуй|спасибо|пока|кто ты|что ты умеешь)/i.test(value)) {
-    return false;
-  }
-
-  const searchPattern =
-    /погод|температур|осадк|пробк|новост|случилось|происходит|происшеств|атак|взрыв|пожар|авари|курс (доллар|евро|валют|рубл|биткоин|юан)|сегодня|сейчас|вчера|на днях|последн|свеж|актуальн|найди|поищи|загугли|в интернете|сколько стоит|сколько стоят|цена|цены|где купить|кто такой|кто такая|кто сейчас|подписчик|результат|итог|выбор|голосован|референдум|президент|парламент|госдум|победил|выиграл|санкци|рейтинг|счёт|счет матча|матч|когда выйдет|когда вышел|расписани|открыт ли|работает ли/i;
-
-  if (searchPattern.test(value)) return true;
-
-  // Любой вопрос из четырёх слов и больше тоже идёт в поиск.
-  return value.split(/\s+/).length >= 4;
+  if (!value) return false;
+  return !NO_SEARCH_PATTERN.test(value);
 }
+
+// Запросы, для которых нужна лента новостей (за неделю).
+const NEWS_PATTERN =
+  /новост|случилось|происходит|происшеств|атак|взрыв|пожар|авари|обстрел|вчера|сегодня|на днях|последн|свеж|только что|что с |что там|итог|результат|выбор|голосован|референдум|победил|выиграл|санкци|матч|счёт|счет/i;
 
 // Убираем вводные слова из разговорной фразы и при необходимости добавляем год,
 // чтобы поисковик находил свежее.
@@ -167,6 +173,131 @@ function cleanSearchQuery(text) {
   }
 
   return query;
+}
+
+// ИЗМЕНЕНО: учитываем контекст диалога. Реплики вроде «а в Москве?» или «что дальше?»
+// сами по себе ничего не значат для поисковика, поэтому дописываем предыдущий вопрос.
+const FOLLOW_UP_PATTERN =
+  /(^|\s)(он|она|оно|они|его|её|ее|их|ему|ей|им|там|тогда|потом|дальше|этот|эта|эти|тот|та|те|такой|такая)(?=\s|$)/;
+
+function buildSearchQuery(text, history) {
+  const base = cleanSearchQuery(text);
+  const wordCount = base.split(/\s+/).filter(Boolean).length;
+  const looksLikeFollowUp =
+    wordCount <= 3 || FOLLOW_UP_PATTERN.test(base) || /^(а|и)\s/i.test(text.trim());
+
+  if (looksLikeFollowUp) {
+    const lastUser = [...history].reverse().find((item) => item.role === "user");
+    if (lastUser) {
+      const previous = cleanSearchQuery(lastUser.text);
+      if (previous && !base.includes(previous)) {
+        return truncate(`${previous} ${base}`, 200);
+      }
+    }
+  }
+
+  return base;
+}
+
+// ИЗМЕНЕНО: окно для новостей зависит от вопроса. Раньше всегда была неделя,
+// и вопросы про события месячной давности («допустили ли партию на выборы»)
+// оставались без новостей. Если пользователь явно просит свежее, берём неделю,
+// иначе год: модель сама выберет самое свежее по датам.
+function newsTimeWindow(text) {
+  if (/сегодня|вчера|сейчас|только что|на днях|последн|свеж/i.test(text)) {
+    return "qdr:w";
+  }
+  return "qdr:y";
+}
+
+// ИЗМЕНЕНО: короткий запрос к Gemini, который превращает разговорную реплику
+// в нормальный поисковый запрос с учётом контекста. Если не уложился в время,
+// используется запасной вариант из buildSearchQuery.
+async function rewriteSearchQuery(userText, history, timeoutMs) {
+  if (!GEMINI_API_KEY || timeoutMs < 400) return "";
+
+  const startedAt = Date.now();
+  const dialog = history
+    .slice(-4)
+    .map(
+      (item) =>
+        `${item.role === "user" ? "Пользователь" : "Ассистент"}: ${truncate(item.text, 300)}`
+    )
+    .join("\n");
+
+  const instruction = [
+    `Сегодня ${currentDateTimeRu()}.`,
+    "Преврати последнюю реплику пользователя в короткий поисковый запрос для Google: 3–8 слов, только ключевые слова, без вводных слов.",
+    "Учитывай контекст диалога: если реплика неполная («а в Москве?», «и что дальше?»), восстанови недостающее из предыдущих сообщений.",
+    "Если вопрос про события этого года, добавь год. Названия, имена и партии пиши так, как их пишут в новостях.",
+    "Верни только сам запрос одной строкой, без кавычек и пояснений.",
+  ].join(" ");
+
+  const generationConfig = { temperature: 0, maxOutputTokens: 120 };
+  if (GEMINI_THINKING_LEVEL) {
+    generationConfig.thinkingConfig = { thinkingLevel: GEMINI_THINKING_LEVEL };
+  }
+
+  const url =
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    `${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+
+  try {
+    const response = await fetchWithTimeout(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: instruction }] },
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { text: `${dialog ? dialog + "\n" : ""}Пользователь: ${userText}` },
+              ],
+            },
+          ],
+          generationConfig,
+        }),
+      },
+      timeoutMs
+    );
+
+    if (!response.ok) {
+      log("query_rewrite_http_error", {
+        status: response.status,
+        durationMs: elapsed(startedAt),
+      });
+      return "";
+    }
+
+    const data = await response.json();
+    const raw = (data?.candidates?.[0]?.content?.parts || [])
+      .map((part) => part.text || "")
+      .join("")
+      .trim();
+
+    const query = raw
+      .split("\n")[0]
+      .replace(/^["«»'\s]+|["«»'\s]+$/g, "")
+      .trim();
+
+    if (!query || query.length > 200) return "";
+
+    log("query_rewritten", { durationMs: elapsed(startedAt), query });
+    return query;
+  } catch (error) {
+    log("query_rewrite_failed", {
+      durationMs: elapsed(startedAt),
+      error:
+        error.name === "AbortError" ? "timeout" : String(error.message || error),
+    });
+    return "";
+  }
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -218,13 +349,17 @@ async function serperRequest(endpoint, query, timeoutMs, extra = {}) {
   }
 }
 
-async function searchSerper(query, timeoutMs) {
+// ИЗМЕНЕНО: новости подмешиваем только для новостных запросов. Раньше они шли
+// в каждый запрос и засоряли ответы на вопросы вроде «кто такой …».
+// Также добавлена справка из knowledgeGraph.
+async function searchSerper(query, timeoutMs, includeNews, newsWindow = "qdr:y") {
   if (!SERPER_API_KEY || timeoutMs < 300) return "";
 
-  // Обычная выдача и новости за неделю запрашиваются параллельно.
   const [web, news] = await Promise.all([
     serperRequest("search", query, timeoutMs),
-    serperRequest("news", query, timeoutMs, { tbs: "qdr:w" }),
+    includeNews
+      ? serperRequest("news", query, timeoutMs, { tbs: newsWindow })
+      : Promise.resolve(null),
   ]);
 
   if (!web && !news) return "";
@@ -234,6 +369,11 @@ async function searchSerper(query, timeoutMs) {
   const answerBox = web?.answerBox?.answer || web?.answerBox?.snippet;
   if (answerBox) {
     lines.push(`Краткий ответ поисковика: ${truncate(answerBox, 350)}`);
+  }
+
+  const kg = web?.knowledgeGraph;
+  if (kg?.description) {
+    lines.push(`Справка (${truncate(kg.title, 80)}): ${truncate(kg.description, 300)}`);
   }
 
   (Array.isArray(news?.news) ? news.news : [])
@@ -260,8 +400,10 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
 
   const startedAt = Date.now();
 
+  // ИЗМЕНЕНО: результаты поиска идут перед вопросом, а не после него,
+  // и явно помечены как актуальные на сегодня.
   const prompt = searchContext
-    ? `${userText}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `Результаты поиска в интернете (актуальны на сегодня):\n${searchContext}\n\nВопрос пользователя: ${userText}\n\nОтветь на вопрос, опираясь на результаты поиска там, где они относятся к вопросу. Если в результатах есть прямой ответ, скажи его в первом же предложении.`
     : userText;
 
   const contents = [
@@ -273,8 +415,8 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
   ];
 
   const generationConfig = {
-    temperature: 0.5,
-    maxOutputTokens: 200,
+    temperature: 0.4,
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
   };
   if (GEMINI_THINKING_LEVEL) {
     generationConfig.thinkingConfig = { thinkingLevel: GEMINI_THINKING_LEVEL };
@@ -329,6 +471,7 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
       log("gemini_blocked", {
         blockReason: data?.promptFeedback?.blockReason || "",
         finishReason: candidate?.finishReason || "",
+        thoughtsTokens: data?.usageMetadata?.thoughtsTokenCount,
         model: GEMINI_MODEL,
       });
       if (data?.promptFeedback?.blockReason) throw new Error("BLOCKED");
@@ -479,13 +622,31 @@ export default async function handler(req, res) {
     });
 
     if (needsSearch && SERPER_API_KEY) {
+      // Запасной вариант запроса, если переписывание не успеет.
+      let searchQuery = buildSearchQuery(userText, history);
+
+      const rewriteBudget = Math.min(
+        REWRITE_TIMEOUT_MS,
+        remainingTime(startedAt) - MIN_MODEL_TIME_MS - 700
+      );
+      if (rewriteBudget >= 400) {
+        const rewritten = await rewriteSearchQuery(userText, history, rewriteBudget);
+        if (rewritten) searchQuery = rewritten;
+      }
+
       const searchBudget = Math.min(
         SERPER_TIMEOUT_MS,
         remainingTime(startedAt) - MIN_MODEL_TIME_MS
       );
 
       if (searchBudget >= 300) {
-        searchContext = await searchSerper(cleanSearchQuery(userText), searchBudget);
+        const includeNews = NEWS_PATTERN.test(`${userText} ${searchQuery}`.toLowerCase());
+        const newsWindow = newsTimeWindow(userText);
+        // Для отладки: видно, что реально ушло в поисковик.
+        log("search_query", { searchQuery, includeNews, newsWindow });
+
+        searchContext = await searchSerper(searchQuery, searchBudget, includeNews, newsWindow);
+        log("search_result", { chars: searchContext.length });
       }
       if (!searchContext) searchContext = NO_SEARCH_NOTE;
     }
