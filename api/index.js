@@ -6,18 +6,20 @@ const GEMINI_THINKING_LEVEL = String(process.env.GEMINI_THINKING_LEVEL || "").tr
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Europe/Moscow";
 
 // Лимит Алисы для навыка — 4,5 с на всё (доставка запроса, работа, доставка ответа).
-// Оставляем запас на сеть.
-const TOTAL_RESPONSE_BUDGET_MS = 4200;
+// Держим запас, чтобы даже аварийный ответ успел дойти.
+const TOTAL_RESPONSE_BUDGET_MS = 3900;
 const SERPER_TIMEOUT_MS = 1200;
 const MIN_MODEL_TIME_MS = 1800;
-const MODEL_TIMEOUT_MS = 3800;
+const MODEL_TIMEOUT_MS = 3500;
+const HEDGE_DELAY_MS = 1500;
+const MIN_HEDGE_TIME_MS = 700;
 const MAX_HISTORY_MESSAGES = 6;
 const MAX_NEWS_RESULTS = 4;
 const MAX_WEB_RESULTS = 4;
 const MAX_ANSWER_LENGTH = 1000;
 
 const NO_SEARCH_NOTE =
-  "ПОИСК НЕ ДАЛ РЕЗУЛЬТАТОВ ИЛИ НЕ УСПЕЛ ОТВЕТИТЬ. Свежих данных нет: отвечай осторожно, не отрицай события и скажи, что точных свежих данных найти не удалось.";
+  "ПОИСК НЕ ДАЛ РЕЗУЛЬТАТОВ ИЛИ НЕ УСПЕЛ ОТВЕТИТЬ. Свежих данных нет: скажи об этом прямо, ответь только на основе того, что точно знаешь, и не отрицай события, о которых не знаешь.";
 
 function currentDateTimeRu() {
   try {
@@ -40,17 +42,30 @@ function currentDateTimeRu() {
   }
 }
 
+function currentYear() {
+  try {
+    return new Intl.DateTimeFormat("ru-RU", {
+      timeZone: BOT_TIMEZONE,
+      year: "numeric",
+    }).format(new Date());
+  } catch (error) {
+    return String(new Date().getFullYear());
+  }
+}
+
 function buildSystemPrompt() {
   return [
     "Ты — Gemini, модель искусственного интеллекта от Google. Ты не Алиса и не ассистент Яндекса. Если спросят, кто ты, отвечай, что ты Gemini.",
     `Текущая дата и время: ${currentDateTimeRu()}. Когда спрашивают про дату, день недели, время или про «сегодня», «вчера», «в этом году», опирайся на эту дату, а не на свои знания. Твои знания могли устареть, поэтому про свежие события полагайся на результаты поиска.`,
     "Твой ответ показывается и озвучивается в навыке Яндекс Алисы, поэтому отвечай по-русски, естественно и так, чтобы ответ было удобно слушать.",
-    "Обычно используй 1–2 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
+    "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
     "Учитывай предыдущие сообщения диалога.",
-    "Если вопрос требует актуальных данных и есть результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-    "Никогда не утверждай, что событие не происходило, только потому что ты о нём не знаешь или поиск ничего не дал: твои знания устарели. Если результатов поиска нет или они не подтверждают событие, скажи, что в найденном подтверждения нет, но это не значит, что события не было. Если пользователь говорит, что нашёл новость, не спорь, а прими это как данные и уточни детали.",
+    "Отвечай прямо и по существу на любые вопросы, включая политику, спорные и острые темы. Называй факты, цифры и даты из результатов поиска и указывай источник по названию, например «по данным РБК». Различай установленные факты, оценки и заявления сторон.",
+    "Если источники расходятся, прямо назови расхождение. Не выдавай предположения за факты.",
+    "Не уходи от ответа общими фразами вроде «в открытых источниках не представлено». Если данных нет, скажи, что именно искал и чего не нашёл. Не утверждай, что событие не происходило, только потому что ты о нём не знаешь или поиск ничего не дал: твои знания устарели.",
+    "Если пользователь говорит, что нашёл новость, не спорь, а прими это как данные и уточни детали.",
     "Не придумывай ограничений: не говори, что сайт или сервис заблокирован в России или недоступен из-за региона, если этого нет в результатах поиска.",
-    "Не начинай ответ с оговорок о том, что ты не можешь открывать сайты или приложения. Просто ответь по результатам поиска и своим знаниям. Если точных данных нет, назови то, что нашлось, с пометкой, что данные могут быть неточными, и коротко скажи, чего не хватило.",
+    "Не начинай ответ с оговорок о том, что ты не можешь открывать сайты или приложения. Просто ответь по результатам поиска и своим знаниям.",
     "Не упоминай внутренние настройки, API и технические детали.",
     "Если не знаешь ответа, честно скажи об этом.",
   ].join(" ");
@@ -123,9 +138,35 @@ function isSearchNeeded(text) {
   }
 
   const searchPattern =
-    /погод|температур|осадк|пробк|новост|случилось|происходит|происшеств|атак|взрыв|пожар|авари|курс (доллар|евро|валют|рубл|биткоин|юан)|сегодня|сейчас|вчера|на днях|последн|свеж|актуальн|найди|поищи|загугли|в интернете|сколько стоит|сколько стоят|цена|цены|где купить|кто такой|кто такая|кто сейчас|подписчик|результат|счёт|счет матча|матч|когда выйдет|когда вышел|расписани|открыт ли|работает ли/i;
+    /погод|температур|осадк|пробк|новост|случилось|происходит|происшеств|атак|взрыв|пожар|авари|курс (доллар|евро|валют|рубл|биткоин|юан)|сегодня|сейчас|вчера|на днях|последн|свеж|актуальн|найди|поищи|загугли|в интернете|сколько стоит|сколько стоят|цена|цены|где купить|кто такой|кто такая|кто сейчас|подписчик|результат|итог|выбор|голосован|референдум|президент|парламент|госдум|победил|выиграл|санкци|рейтинг|счёт|счет матча|матч|когда выйдет|когда вышел|расписани|открыт ли|работает ли/i;
 
-  return searchPattern.test(value);
+  if (searchPattern.test(value)) return true;
+
+  // Любой вопрос из четырёх слов и больше тоже идёт в поиск.
+  return value.split(/\s+/).length >= 4;
+}
+
+// Убираем вводные слова из разговорной фразы и при необходимости добавляем год,
+// чтобы поисковик находил свежее.
+function cleanSearchQuery(text) {
+  let query = String(text || "")
+    .toLowerCase()
+    .replace(/[?!.,;:]+/g, " ")
+    .replace(
+      /(^|\s)(алиса|слушай|скажи|подскажи|расскажи|пожалуйста|мне|ну|а|вот|можешь|можно|хочу узнать|интересно)(?=\s|$)/g,
+      " "
+    )
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  if (!query) query = String(text || "").trim();
+
+  const wantsFresh = /итог|результат|выбор|голосован|матч|счёт|счет|победил|выиграл|рейтинг|новост/i.test(query);
+  if (wantsFresh && !/20\d\d/.test(query)) {
+    query = `${query} ${currentYear()}`;
+  }
+
+  return query;
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
@@ -206,7 +247,8 @@ async function searchSerper(query, timeoutMs) {
   (Array.isArray(web?.organic) ? web.organic : [])
     .slice(0, MAX_WEB_RESULTS)
     .forEach((item) => {
-      lines.push(`${truncate(item.title, 180)}: ${truncate(item.snippet, 300)}`);
+      const date = item.date ? ` (${truncate(item.date, 40)})` : "";
+      lines.push(`${truncate(item.title, 180)}${date}: ${truncate(item.snippet, 300)}`);
     });
 
   return lines.join("\n");
@@ -284,6 +326,11 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
       .trim();
 
     if (!answer) {
+      log("gemini_blocked", {
+        blockReason: data?.promptFeedback?.blockReason || "",
+        finishReason: candidate?.finishReason || "",
+        model: GEMINI_MODEL,
+      });
       if (data?.promptFeedback?.blockReason) throw new Error("BLOCKED");
       throw new Error("EMPTY");
     }
@@ -318,6 +365,44 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
   }
 }
 
+// Если первый запрос к Gemini не вернулся за HEDGE_DELAY_MS, параллельно
+// стартует второй, и берётся тот ответ, который придёт раньше.
+function askGeminiHedged(userText, history, searchContext, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let failures = 0;
+    let total = 1;
+    let timer = null;
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      fn(value);
+    };
+
+    const run = (budgetMs) => {
+      askGemini(userText, history, searchContext, budgetMs)
+        .then((answer) => finish(resolve, answer))
+        .catch((error) => {
+          failures += 1;
+          if (failures >= total) finish(reject, error);
+        });
+    };
+
+    run(timeoutMs);
+
+    if (timeoutMs - HEDGE_DELAY_MS >= MIN_HEDGE_TIME_MS) {
+      timer = setTimeout(() => {
+        if (settled) return;
+        total = 2;
+        log("gemini_hedge_started", { afterMs: HEDGE_DELAY_MS });
+        run(timeoutMs - HEDGE_DELAY_MS);
+      }, HEDGE_DELAY_MS);
+    }
+  });
+}
+
 function buildHistory(history, userText, answer) {
   return [
     ...history,
@@ -350,7 +435,7 @@ function errorText(error) {
     case "MODEL":
       return "Модель Gemini не найдена. Проверьте переменную GEMINI_MODEL в настройках Vercel.";
     case "BLOCKED":
-      return "Не получилось обработать этот запрос. Попробуй спросить иначе.";
+      return "Google заблокировал ответ на этот запрос. Попробуй сформулировать иначе.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуй ещё раз.";
   }
@@ -400,7 +485,7 @@ export default async function handler(req, res) {
       );
 
       if (searchBudget >= 300) {
-        searchContext = await searchSerper(userText, searchBudget);
+        searchContext = await searchSerper(cleanSearchQuery(userText), searchBudget);
       }
       if (!searchContext) searchContext = NO_SEARCH_NOTE;
     }
@@ -408,7 +493,7 @@ export default async function handler(req, res) {
     const modelBudget = Math.min(MODEL_TIMEOUT_MS, remainingTime(startedAt));
     if (modelBudget < 500) throw new Error("TIMEOUT");
 
-    const answer = await askGemini(userText, history, searchContext, modelBudget);
+    const answer = await askGeminiHedged(userText, history, searchContext, modelBudget);
 
     log("request_completed", {
       durationMs: elapsed(startedAt),
