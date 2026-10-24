@@ -23,10 +23,27 @@ function groundingEnabled() {
   return isGeminiProvider() && String(process.env.GEMINI_GROUNDING || "").trim() === "1";
 }
 
+function currentDateTimeRu() {
+  const tz = String(process.env.BOT_TIMEZONE || "Europe/Moscow").trim();
+  try {
+    const now = new Date();
+    const date = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: tz, weekday: "long", day: "numeric", month: "long", year: "numeric"
+    }).format(now);
+    const time = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: tz, hour: "2-digit", minute: "2-digit"
+    }).format(now);
+    return `${date}, ${time} (часовой пояс ${tz})`;
+  } catch (error) {
+    return new Date().toISOString();
+  }
+}
+
 function buildSystemPrompt() {
   const { name, maker } = providerInfo();
   return [
     `Ты — ${name}, модель искусственного интеллекта от ${maker}. Ты не Алиса и не ассистент Яндекса. Если спросят, кто ты, отвечай, что ты ${name}.`,
+    `Текущая дата и время: ${currentDateTimeRu()}. Когда спрашивают про дату, день недели, время или про «сегодня», «вчера», «в этом году», опирайся на эту дату, а не на свои знания. Твои знания могли устареть, поэтому про свежие события полагайся на результаты поиска.`,
     "Твой ответ показывается и озвучивается в навыке Яндекс Алисы, поэтому отвечай по-русски, кратко и так, чтобы ответ было удобно слушать.",
     "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
     "Если вопрос требует актуальных данных и есть результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
@@ -216,225 +233,4 @@ async function askClaude(text, history, searchContext, timeoutMs) {
   return answer;
 }
 
-async function askOpenAI(text, history, searchContext, timeoutMs) {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) throw new Error("MISSING_OPENAI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL).trim();
-  if (!/^[A-Za-z0-9._:-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
-  const messages = [
-    { role: "system", content: buildSystemPrompt() },
-    ...safeHistory(history).map(item => ({
-      role: item.role === "model" ? "assistant" : "user",
-      content: item.text
-    })),
-    { role: "user", content: buildPrompt(text, searchContext) }
-  ];
-
-  const { response, data } = await fetchJson(
-    "https://api.openai.com/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        max_completion_tokens: 300
-      })
-    },
-    Math.min(MODEL_TIMEOUT_MS, timeoutMs)
-  );
-
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("OpenAI request failed with HTTP", status, data?.error?.message || "");
-    if (status === 401 || status === 403) throw new Error("OPENAI_KEY_REJECTED");
-    if (status === 404) throw new Error("OPENAI_MODEL_NOT_FOUND");
-    if (status === 429) throw new Error("MODEL_QUOTA");
-    throw new Error("OPENAI_REQUEST_FAILED");
-  }
-
-  const choice = data?.choices?.[0];
-  const answer = String(choice?.message?.content || "").trim();
-
-  if (!answer) {
-    if (choice?.message?.refusal || choice?.finish_reason === "content_filter") {
-      throw new Error("MODEL_BLOCKED");
-    }
-    throw new Error("MODEL_EMPTY_RESPONSE");
-  }
-  if (choice?.finish_reason === "length") {
-    console.warn("OpenAI reached the output token limit.");
-  }
-  return answer;
-}
-
-async function askGemini(text, history, searchContext, timeoutMs, grounding = false) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
-  contents.push({ role: "user", parts: [{ text: buildPrompt(text, searchContext) }] });
-
-  const requestBody = {
-    systemInstruction: { parts: [{ text: buildSystemPrompt() }] },
-    contents,
-    generationConfig: {
-      temperature: 0.5,
-      maxOutputTokens: grounding ? 320 : 240
-    }
-  };
-  if (grounding) requestBody.tools = [{ google_search: {} }];
-
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify(requestBody)
-    },
-    timeoutMs
-  );
-
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status, data?.error?.message || "");
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("MODEL_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
-
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("MODEL_BLOCKED");
-    throw new Error("MODEL_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
-  return answer;
-}
-
-function errorForUser(error) {
-  switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "MISSING_OPENAI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную OPENAI_API_KEY в настройках Vercel.";
-    case "MISSING_ANTHROPIC_KEY":
-      return "Сервер пока не настроен. Проверьте переменную ANTHROPIC_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "OPENAI_KEY_REJECTED":
-      return "Не удалось подключиться к ChatGPT. Проверьте API-ключ в настройках Vercel.";
-    case "ANTHROPIC_KEY_REJECTED":
-      return "Не удалось подключиться к Claude. Проверьте API-ключ в настройках Vercel.";
-    case "OPENAI_MODEL_NOT_FOUND":
-      return "Модель ChatGPT не найдена. Проверьте переменную OPENAI_MODEL в настройках Vercel.";
-    case "ANTHROPIC_MODEL_NOT_FOUND":
-      return "Модель Claude не найдена. Проверьте переменную ANTHROPIC_MODEL в настройках Vercel.";
-    case "MODEL_QUOTA":
-      return "Сейчас превышен лимит запросов или закончились средства на счёте. Попробуйте позже.";
-    case "MODEL_BLOCKED":
-      return "Не получилось обработать этот запрос. Попробуйте спросить иначе.";
-    case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
-      return "Ответ не уложился в отведённое время. Попробуйте задать вопрос ещё раз, чуть короче.";
-    default:
-      return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
-  }
-}
-
-export default async function handler(req, res) {
-  if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
-    });
-  }
-
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-
-  const startedAt = Date.now();
-  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
-  const body = req.body && typeof req.body === "object" ? req.body : {};
-  const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
-  const oldHistory = safeHistory(body?.state?.session?.history);
-
-  if (!text) {
-    return res.status(200).json(aliceResponse(
-      `Привет! Я ${providerInfo().name}. Могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?`,
-      false,
-      oldHistory
-    ));
-  }
-
-  if (isExitIntent(text)) {
-    return res.status(200).json(aliceResponse("Хорошо, до встречи!", true, []));
-  }
-
-  try {
-    const wantsSearch = isSearchIntent(text);
-    const useGrounding = wantsSearch && groundingEnabled();
-    let searchContext = "";
-
-    if (wantsSearch && !useGrounding && process.env.SERPER_API_KEY) {
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
-    }
-
-    const reserveMs = useGrounding ? 300 : 600;
-    const limitMs = useGrounding ? GROUNDED_MODEL_TIMEOUT_MS : MODEL_TIMEOUT_MS;
-    const timeoutMs = Math.max(0, Math.min(limitMs, remainingMs() - reserveMs));
-
-    let answer;
-    if (process.env.ANTHROPIC_API_KEY) {
-      answer = await askClaude(text, oldHistory, searchContext, timeoutMs);
-    } else if (process.env.OPENAI_API_KEY) {
-      answer = await askOpenAI(text, oldHistory, searchContext, timeoutMs);
-    } else {
-      answer = await askGemini(text, oldHistory, searchContext, timeoutMs, useGrounding);
-    }
-
-    if (useGrounding) console.log("Answered with Gemini Google Search grounding in", Date.now() - startedAt, "ms");
-
-    const history = [
-      ...oldHistory,
-      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES);
-
-    return res.status(200).json(aliceResponse(answer, false, history));
-  } catch (error) {
-    const safeError = error?.message === "AbortError" || error?.name === "AbortError"
-      ? { message: "TIME_BUDGET_EXHAUSTED" }
-      : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
-  }
-}
-
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+async function
