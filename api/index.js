@@ -2,14 +2,15 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+const GEMINI_THINKING_LEVEL = String(process.env.GEMINI_THINKING_LEVEL || "").trim();
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Europe/Moscow";
 
 // Лимит Алисы для навыка — 4,5 с на всё (доставка запроса, работа, доставка ответа).
 // Оставляем запас на сеть.
-const TOTAL_RESPONSE_BUDGET_MS = 4000;
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 1200;
 const MIN_MODEL_TIME_MS = 1800;
-const MODEL_TIMEOUT_MS = 3300;
+const MODEL_TIMEOUT_MS = 3800;
 const MAX_HISTORY_MESSAGES = 6;
 const MAX_NEWS_RESULTS = 4;
 const MAX_WEB_RESULTS = 4;
@@ -44,7 +45,7 @@ function buildSystemPrompt() {
     "Ты — Gemini, модель искусственного интеллекта от Google. Ты не Алиса и не ассистент Яндекса. Если спросят, кто ты, отвечай, что ты Gemini.",
     `Текущая дата и время: ${currentDateTimeRu()}. Когда спрашивают про дату, день недели, время или про «сегодня», «вчера», «в этом году», опирайся на эту дату, а не на свои знания. Твои знания могли устареть, поэтому про свежие события полагайся на результаты поиска.`,
     "Твой ответ показывается и озвучивается в навыке Яндекс Алисы, поэтому отвечай по-русски, естественно и так, чтобы ответ было удобно слушать.",
-    "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
+    "Обычно используй 1–2 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
     "Учитывай предыдущие сообщения диалога.",
     "Если вопрос требует актуальных данных и есть результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
     "Никогда не утверждай, что событие не происходило, только потому что ты о нём не знаешь или поиск ничего не дал: твои знания устарели. Если результатов поиска нет или они не подтверждают событие, скажи, что в найденном подтверждения нет, но это не значит, что события не было. Если пользователь говорит, что нашёл новость, не спорь, а прими это как данные и уточни детали.",
@@ -229,6 +230,14 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
     { role: "user", parts: [{ text: prompt }] },
   ];
 
+  const generationConfig = {
+    temperature: 0.5,
+    maxOutputTokens: 200,
+  };
+  if (GEMINI_THINKING_LEVEL) {
+    generationConfig.thinkingConfig = { thinkingLevel: GEMINI_THINKING_LEVEL };
+  }
+
   const url =
     "https://generativelanguage.googleapis.com/v1beta/models/" +
     `${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
@@ -245,10 +254,7 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: buildSystemPrompt() }] },
           contents,
-          generationConfig: {
-            temperature: 0.5,
-            maxOutputTokens: 300,
-          },
+          generationConfig,
         }),
       },
       timeoutMs
@@ -261,6 +267,7 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
         status: response.status,
         durationMs: elapsed(startedAt),
         model: GEMINI_MODEL,
+        thinkingLevel: GEMINI_THINKING_LEVEL || "default",
         details: truncate(data?.error?.message || "Unknown Gemini API error", 300),
       });
 
@@ -285,13 +292,22 @@ async function askGemini(userText, history, searchContext, timeoutMs) {
       durationMs: elapsed(startedAt),
       answerLength: answer.length,
       model: GEMINI_MODEL,
+      thinkingLevel: GEMINI_THINKING_LEVEL || "default",
       finishReason: candidate?.finishReason || "",
+      promptTokens: data?.usageMetadata?.promptTokenCount,
+      answerTokens: data?.usageMetadata?.candidatesTokenCount,
+      thoughtsTokens: data?.usageMetadata?.thoughtsTokenCount,
     });
 
     return answer;
   } catch (error) {
     if (error.name === "AbortError") {
-      log("gemini_failed", { durationMs: elapsed(startedAt), error: "timeout" });
+      log("gemini_failed", {
+        durationMs: elapsed(startedAt),
+        error: "timeout",
+        timeoutBudgetMs: timeoutMs,
+        model: GEMINI_MODEL,
+      });
       throw new Error("TIMEOUT");
     }
     log("gemini_failed", {
