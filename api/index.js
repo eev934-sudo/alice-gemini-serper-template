@@ -23,10 +23,27 @@ function groundingEnabled() {
   return isGeminiProvider() && String(process.env.GEMINI_GROUNDING || "").trim() === "1";
 }
 
+function currentDateTimeRu() {
+  const tz = String(process.env.BOT_TIMEZONE || "Europe/Moscow").trim();
+  try {
+    const now = new Date();
+    const date = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: tz, weekday: "long", day: "numeric", month: "long", year: "numeric"
+    }).format(now);
+    const time = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: tz, hour: "2-digit", minute: "2-digit"
+    }).format(now);
+    return `${date}, ${time} (часовой пояс ${tz})`;
+  } catch (error) {
+    return new Date().toISOString();
+  }
+}
+
 function buildSystemPrompt() {
   const { name, maker } = providerInfo();
   return [
     `Ты — ${name}, модель искусственного интеллекта от ${maker}. Ты не Алиса и не ассистент Яндекса. Если спросят, кто ты, отвечай, что ты ${name}.`,
+    `Текущая дата и время: ${currentDateTimeRu()}. Когда спрашивают про дату, день недели, время или про «сегодня», «вчера», «в этом году», опирайся на эту дату, а не на свои знания. Твои знания могли устареть, поэтому про свежие события полагайся на результаты поиска.`,
     "Твой ответ показывается и озвучивается в навыке Яндекс Алисы, поэтому отвечай по-русски, кратко и так, чтобы ответ было удобно слушать.",
     "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
     "Если вопрос требует актуальных данных и есть результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
