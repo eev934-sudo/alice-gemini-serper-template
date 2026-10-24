@@ -7,6 +7,7 @@ const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 1000;
 const MODEL_TIMEOUT_MS = 2500;
+const GROUNDED_MODEL_TIMEOUT_MS = 3300;
 
 function providerInfo() {
   if (process.env.ANTHROPIC_API_KEY) return { name: "Claude", maker: "Anthropic" };
@@ -14,15 +15,23 @@ function providerInfo() {
   return { name: "Gemini", maker: "Google" };
 }
 
+function isGeminiProvider() {
+  return !process.env.ANTHROPIC_API_KEY && !process.env.OPENAI_API_KEY;
+}
+
+function groundingEnabled() {
+  return isGeminiProvider() && String(process.env.GEMINI_GROUNDING || "").trim() === "1";
+}
+
 function buildSystemPrompt() {
   const { name, maker } = providerInfo();
   return [
     `Ты — ${name}, модель искусственного интеллекта от ${maker}. Ты не Алиса и не ассистент Яндекса. Если спросят, кто ты, отвечай, что ты ${name}.`,
     "Твой ответ показывается и озвучивается в навыке Яндекс Алисы, поэтому отвечай по-русски, кратко и так, чтобы ответ было удобно слушать.",
-    "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-    "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-    "Не придумывай ограничений: не говори, что сайт или сервис заблокирован в России или недоступен из-за региона, если этого нет в переданных результатах поиска.",
-    "Ты не открываешь сайты сам: ты опираешься на переданные результаты поиска и на свои знания. Если точных данных нет (например, число подписчиков, цена, счёт матча), скажи, что в найденных результатах этого нет, и назови то, что нашлось, с пометкой, что данные могут быть неточными или устаревшими.",
+    "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
+    "Если вопрос требует актуальных данных и есть результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+    "Не придумывай ограничений: не говори, что сайт или сервис заблокирован в России или недоступен из-за региона, если этого нет в результатах поиска.",
+    "Не начинай ответ с оговорок о том, что ты не можешь открывать сайты или приложения. Просто ответь по результатам поиска и своим знаниям. Если точных данных нет, назови то, что нашлось, с пометкой, что данные могут быть неточными, и коротко скажи, чего не хватило.",
     "На новостные и спорные темы отвечай по существу и нейтрально, опираясь на результаты поиска, если они есть.",
     "Если не знаешь ответа, честно скажи об этом."
   ].join(" ");
@@ -60,7 +69,9 @@ function fitAliceText(value) {
 }
 
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up|followers)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|что происходит|что случилось|расскажи про|беспилот|дрон|подписчик|сколько у|кто такой|кто такая/i.test(text);
+  const t = String(text || "").trim();
+  if (/^(привет|здравствуй|спасибо|пока|хватит|стоп|кто ты|что ты умеешь)/i.test(t)) return false;
+  return t.split(/\s+/).length >= 3;
 }
 
 function isExitIntent(text) {
@@ -100,7 +111,7 @@ async function searchWeb(query, timeoutMs) {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, hl: "ru", num: 3 })
+        body: JSON.stringify({ q: query, hl: "ru", num: 5 })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
@@ -111,7 +122,7 @@ async function searchWeb(query, timeoutMs) {
     }
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
+      .slice(0, 5)
       .map((item, i) => {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
@@ -263,7 +274,7 @@ async function askOpenAI(text, history, searchContext, timeoutMs) {
   return answer;
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, searchContext, timeoutMs, grounding = false) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
@@ -277,6 +288,16 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }));
   contents.push({ role: "user", parts: [{ text: buildPrompt(text, searchContext) }] });
 
+  const requestBody = {
+    systemInstruction: { parts: [{ text: buildSystemPrompt() }] },
+    contents,
+    generationConfig: {
+      temperature: 0.5,
+      maxOutputTokens: grounding ? 320 : 240
+    }
+  };
+  if (grounding) requestBody.tools = [{ google_search: {} }];
+
   const { response, data } = await fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
@@ -285,21 +306,14 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         "Content-Type": "application/json",
         "x-goog-api-key": key
       },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: buildSystemPrompt() }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
-      })
+      body: JSON.stringify(requestBody)
     },
-    Math.min(MODEL_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    console.error("Gemini request failed with HTTP", status, data?.error?.message || "");
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("MODEL_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
@@ -319,13 +333,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     console.warn("Gemini reached the output token limit.");
   }
   return answer;
-}
-
-function askModel(text, history, searchContext, timeoutMs) {
-  // Приоритет: Claude, затем ChatGPT, затем Gemini — по тому, какой ключ задан в Vercel.
-  if (process.env.ANTHROPIC_API_KEY) return askClaude(text, history, searchContext, timeoutMs);
-  if (process.env.OPENAI_API_KEY) return askOpenAI(text, history, searchContext, timeoutMs);
-  return askGemini(text, history, searchContext, timeoutMs);
 }
 
 function errorForUser(error) {
@@ -391,17 +398,28 @@ export default async function handler(req, res) {
   }
 
   try {
+    const wantsSearch = isSearchIntent(text);
+    const useGrounding = wantsSearch && groundingEnabled();
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+
+    if (wantsSearch && !useGrounding && process.env.SERPER_API_KEY) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askModel(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(MODEL_TIMEOUT_MS, remainingMs() - 600))
-    );
+    const reserveMs = useGrounding ? 300 : 600;
+    const limitMs = useGrounding ? GROUNDED_MODEL_TIMEOUT_MS : MODEL_TIMEOUT_MS;
+    const timeoutMs = Math.max(0, Math.min(limitMs, remainingMs() - reserveMs));
+
+    let answer;
+    if (process.env.ANTHROPIC_API_KEY) {
+      answer = await askClaude(text, oldHistory, searchContext, timeoutMs);
+    } else if (process.env.OPENAI_API_KEY) {
+      answer = await askOpenAI(text, oldHistory, searchContext, timeoutMs);
+    } else {
+      answer = await askGemini(text, oldHistory, searchContext, timeoutMs, useGrounding);
+    }
+
+    if (useGrounding) console.log("Answered with Gemini Google Search grounding in", Date.now() - startedAt, "ms");
 
     const history = [
       ...oldHistory,
@@ -411,7 +429,9 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.message === "AbortError" || error?.name === "AbortError"
+      ? { message: "TIME_BUDGET_EXHAUSTED" }
+      : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
