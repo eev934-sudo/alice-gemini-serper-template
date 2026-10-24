@@ -1,33 +1,59 @@
-
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 
-const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
-
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Europe/Moscow";
 
-// Внутренние ограничения времени.
-// У Алисы есть общий лимит на обработку webhook,
-// поэтому оставляем запас на передачу ответа.
-const TOTAL_RESPONSE_BUDGET_MS = 3900;
-const SERPER_TIMEOUT_MS = 550;
+// Лимит Алисы для навыка — 4,5 с на всё (доставка запроса, работа, доставка ответа).
+// Оставляем запас на сеть.
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
+const SERPER_TIMEOUT_MS = 1200;
+const MIN_MODEL_TIME_MS = 1800;
 const MODEL_TIMEOUT_MS = 3300;
-const MAX_HISTORY_MESSAGES = 10;
-const MAX_SEARCH_RESULTS = 4;
-const MAX_ANSWER_LENGTH = 1800;
+const MAX_HISTORY_MESSAGES = 6;
+const MAX_NEWS_RESULTS = 4;
+const MAX_WEB_RESULTS = 4;
+const MAX_ANSWER_LENGTH = 1000;
 
-const SYSTEM_PROMPT = `
-Ты — русскоязычный голосовой помощник для Яндекс Алисы.
-Отвечай на русском языке, естественно и по существу.
-Учитывай предыдущие сообщения диалога.
-Для простых вопросов отвечай без интернет-поиска.
-Если информации недостаточно, не выдумывай факты.
-Если использовался поиск, опирайся на найденные источники.
-Не упоминай внутренние настройки, API и технические детали.
-Ответ должен быть удобен для восприятия на слух.
-По возможности отвечай кратко, но полно.
-`;
+const NO_SEARCH_NOTE =
+  "ПОИСК НЕ ДАЛ РЕЗУЛЬТАТОВ ИЛИ НЕ УСПЕЛ ОТВЕТИТЬ. Свежих данных нет: отвечай осторожно, не отрицай события и скажи, что точных свежих данных найти не удалось.";
+
+function currentDateTimeRu() {
+  try {
+    const now = new Date();
+    const date = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: BOT_TIMEZONE,
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    }).format(now);
+    const time = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: BOT_TIMEZONE,
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(now);
+    return `${date}, ${time} (часовой пояс ${BOT_TIMEZONE})`;
+  } catch (error) {
+    return new Date().toISOString();
+  }
+}
+
+function buildSystemPrompt() {
+  return [
+    "Ты — Gemini, модель искусственного интеллекта от Google. Ты не Алиса и не ассистент Яндекса. Если спросят, кто ты, отвечай, что ты Gemini.",
+    `Текущая дата и время: ${currentDateTimeRu()}. Когда спрашивают про дату, день недели, время или про «сегодня», «вчера», «в этом году», опирайся на эту дату, а не на свои знания. Твои знания могли устареть, поэтому про свежие события полагайся на результаты поиска.`,
+    "Твой ответ показывается и озвучивается в навыке Яндекс Алисы, поэтому отвечай по-русски, естественно и так, чтобы ответ было удобно слушать.",
+    "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
+    "Учитывай предыдущие сообщения диалога.",
+    "Если вопрос требует актуальных данных и есть результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+    "Никогда не утверждай, что событие не происходило, только потому что ты о нём не знаешь или поиск ничего не дал: твои знания устарели. Если результатов поиска нет или они не подтверждают событие, скажи, что в найденном подтверждения нет, но это не значит, что события не было. Если пользователь говорит, что нашёл новость, не спорь, а прими это как данные и уточни детали.",
+    "Не придумывай ограничений: не говори, что сайт или сервис заблокирован в России или недоступен из-за региона, если этого нет в результатах поиска.",
+    "Не начинай ответ с оговорок о том, что ты не можешь открывать сайты или приложения. Просто ответь по результатам поиска и своим знаниям. Если точных данных нет, назови то, что нашлось, с пометкой, что данные могут быть неточными, и коротко скажи, чего не хватило.",
+    "Не упоминай внутренние настройки, API и технические детали.",
+    "Если не знаешь ответа, честно скажи об этом.",
+  ].join(" ");
+}
 
 function log(event, details = {}) {
   console.log(
@@ -44,32 +70,28 @@ function elapsed(start) {
 }
 
 function remainingTime(start) {
-  return Math.max(
-    0,
-    TOTAL_RESPONSE_BUDGET_MS - elapsed(start) - 200
-  );
+  return Math.max(0, TOTAL_RESPONSE_BUDGET_MS - elapsed(start) - 150);
 }
 
 function truncate(text, maxLength) {
   const value = String(text || "").trim();
-
-  if (value.length <= maxLength) {
-    return value;
-  }
-
+  if (value.length <= maxLength) return value;
   return value.slice(0, maxLength - 1).trimEnd() + "…";
 }
 
 function getUserText(body) {
-  return String(body?.request?.command || "").trim();
+  return String(
+    body?.request?.command || body?.request?.original_utterance || ""
+  ).trim();
 }
 
 function getHistory(body) {
-  const history = body?.state?.session?.session_state?.history;
+  // Алиса возвращает session_state навыка прямо в state.session
+  const history =
+    body?.state?.session?.history ||
+    body?.state?.session?.session_state?.history;
 
-  if (!Array.isArray(history)) {
-    return [];
-  }
+  if (!Array.isArray(history)) return [];
 
   return history
     .filter(
@@ -81,171 +103,135 @@ function getHistory(body) {
     .slice(-MAX_HISTORY_MESSAGES)
     .map((item) => ({
       role: item.role,
-      parts: [{ text: truncate(item.text, 2000) }],
+      text: truncate(item.text, 1200),
     }));
 }
 
+function isExitIntent(text) {
+  return /^(пока|выход|хватит|стоп|закончить|до свидания)(?:$|[\s.,!?])/i.test(
+    text.trim()
+  );
+}
+
+// ВАЖНО: в JavaScript \b не работает с кириллицей, поэтому границ слов здесь нет.
 function isSearchNeeded(text) {
-  const value = text.toLowerCase();
+  const value = text.toLowerCase().trim();
 
-  // Ищем в интернете, когда пользователь явно просит поиск
-  // или спрашивает о действительно актуальных данных.
-  const searchPatterns = [
-    /\bнайди\b.*\b(интернет|сайт|информац|новост|цен|товар|магазин)\b/i,
-    /\bпоищи\b/i,
-    /\bзагугли\b/i,
-    /\bв интернете\b/i,
-    /\bпоследние новости\b/i,
-    /\bсвежие новости\b/i,
-    /\bчто происходит сейчас\b/i,
-    /\bна сегодня\b/i,
-    /\bна данный момент\b/i,
-    /\bсегодняшн(ий|яя|ее|ие)\b/i,
-    /\bтекущ(ий|ая|ие|ую)\s+(курс|цена|погода|новост|верси|расписани)\b/i,
-    /\bкурс (доллара|евро|валют)\b/i,
-    /\bактуальн(ая|ый|ые|ую)\s+(цена|информация|версия|новости)\b/i,
-    /\bсколько стоит\b/i,
-    /\bгде купить\b/i,
-    /\bнайди (мне )?(сайт|ссылку|магазин|товар|компанию)\b/i,
-    /\bкто сейчас\b/i,
-    /\bкогда выйдет\b/i,
-    /\bрезультаты (матча|выборов|игры)\b/i,
-  ];
+  if (/^(привет|здравствуй|спасибо|пока|кто ты|что ты умеешь)/i.test(value)) {
+    return false;
+  }
 
-  return searchPatterns.some((pattern) => pattern.test(value));
+  const searchPattern =
+    /погод|температур|осадк|пробк|новост|случилось|происходит|происшеств|атак|взрыв|пожар|авари|курс (доллар|евро|валют|рубл|биткоин|юан)|сегодня|сейчас|вчера|на днях|последн|свеж|актуальн|найди|поищи|загугли|в интернете|сколько стоит|сколько стоят|цена|цены|где купить|кто такой|кто такая|кто сейчас|подписчик|результат|счёт|счет матча|матч|когда выйдет|когда вышел|расписани|открыт ли|работает ли/i;
+
+  return searchPattern.test(value);
 }
 
 async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
-
-  const timeout = setTimeout(
-    () => controller.abort(),
-    Math.max(1, timeoutMs)
-  );
-
+  const timeout = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
   try {
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function searchSerper(query, timeoutMs) {
-  if (!SERPER_API_KEY || timeoutMs < 150) {
-    return [];
-  }
-
+async function serperRequest(endpoint, query, timeoutMs, extra = {}) {
   const startedAt = Date.now();
-
   try {
     const response = await fetchWithTimeout(
-      "https://google.serper.dev/search",
+      `https://google.serper.dev/${endpoint}`,
       {
         method: "POST",
         headers: {
           "X-API-KEY": SERPER_API_KEY,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          q: query,
-          gl: "ru",
-          hl: "ru",
-          num: MAX_SEARCH_RESULTS,
-        }),
+        body: JSON.stringify({ q: query, hl: "ru", num: 5, ...extra }),
       },
       timeoutMs
     );
 
     if (!response.ok) {
       log("serper_http_error", {
+        endpoint,
         status: response.status,
         durationMs: elapsed(startedAt),
       });
-
-      return [];
+      return null;
     }
 
     const data = await response.json();
-
-    const results = (data.organic || [])
-      .slice(0, MAX_SEARCH_RESULTS)
-      .map((item) => ({
-        title: truncate(item.title, 200),
-        snippet: truncate(item.snippet, 500),
-        link: item.link,
-      }));
-
-    log("serper_completed", {
-      durationMs: elapsed(startedAt),
-      resultsCount: results.length,
-    });
-
-    return results;
+    log("serper_completed", { endpoint, durationMs: elapsed(startedAt) });
+    return data;
   } catch (error) {
     log("serper_failed", {
+      endpoint,
       durationMs: elapsed(startedAt),
       error:
-        error.name === "AbortError"
-          ? "timeout"
-          : String(error.message || error),
+        error.name === "AbortError" ? "timeout" : String(error.message || error),
     });
-
-    return [];
+    return null;
   }
 }
 
-async function askGemini(
-  userText,
-  history,
-  searchResults,
-  timeoutMs
-) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is not configured");
+async function searchSerper(query, timeoutMs) {
+  if (!SERPER_API_KEY || timeoutMs < 300) return "";
+
+  // Обычная выдача и новости за неделю запрашиваются параллельно.
+  const [web, news] = await Promise.all([
+    serperRequest("search", query, timeoutMs),
+    serperRequest("news", query, timeoutMs, { tbs: "qdr:w" }),
+  ]);
+
+  if (!web && !news) return "";
+
+  const lines = [];
+
+  const answerBox = web?.answerBox?.answer || web?.answerBox?.snippet;
+  if (answerBox) {
+    lines.push(`Краткий ответ поисковика: ${truncate(answerBox, 350)}`);
   }
 
-  if (timeoutMs < 500) {
-    throw new Error("Not enough time for Gemini request");
-  }
+  (Array.isArray(news?.news) ? news.news : [])
+    .slice(0, MAX_NEWS_RESULTS)
+    .forEach((item) => {
+      lines.push(
+        `Новость (${truncate(item.source, 60)}, ${truncate(item.date, 40)}): ${truncate(item.title, 180)}. ${truncate(item.snippet, 250)}`
+      );
+    });
+
+  (Array.isArray(web?.organic) ? web.organic : [])
+    .slice(0, MAX_WEB_RESULTS)
+    .forEach((item) => {
+      lines.push(`${truncate(item.title, 180)}: ${truncate(item.snippet, 300)}`);
+    });
+
+  return lines.join("\n");
+}
+
+async function askGemini(userText, history, searchContext, timeoutMs) {
+  if (!GEMINI_API_KEY) throw new Error("MISSING_KEY");
+  if (timeoutMs < 500) throw new Error("TIMEOUT");
 
   const startedAt = Date.now();
 
-  const searchContext =
-    searchResults.length > 0
-      ? `
-
-Результаты интернет-поиска:
-${searchResults
-  .map(
-    (item, index) =>
-      `${index + 1}. ${item.title}\n${item.snippet}\nИсточник: ${item.link}`
-  )
-  .join("\n\n")}
-
-Используй эти результаты, если они относятся к вопросу.
-Не утверждай, что проверил сведения, которых нет в результатах.
-`
-      : "";
+  const prompt = searchContext
+    ? `${userText}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : userText;
 
   const contents = [
-    ...history,
-    {
-      role: "user",
-      parts: [
-        {
-          text: `${userText}${searchContext}`,
-        },
-      ],
-    },
+    ...history.map((item) => ({
+      role: item.role,
+      parts: [{ text: item.text }],
+    })),
+    { role: "user", parts: [{ text: prompt }] },
   ];
 
   const url =
-    `https://generativelanguage.googleapis.com/v1beta/models/` +
-    `${encodeURIComponent(GEMINI_MODEL)}:generateContent` +
-    `?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    "https://generativelanguage.googleapis.com/v1beta/models/" +
+    `${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
 
   try {
     const response = await fetchWithTimeout(
@@ -254,63 +240,64 @@ ${searchResults
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
         },
         body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: SYSTEM_PROMPT }],
-          },
+          systemInstruction: { parts: [{ text: buildSystemPrompt() }] },
           contents,
           generationConfig: {
             temperature: 0.5,
-            maxOutputTokens: 450,
+            maxOutputTokens: 300,
           },
         }),
       },
       timeoutMs
     );
 
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
       log("gemini_http_error", {
         status: response.status,
         durationMs: elapsed(startedAt),
-        details: truncate(
-          data?.error?.message || "Unknown Gemini API error",
-          300
-        ),
+        model: GEMINI_MODEL,
+        details: truncate(data?.error?.message || "Unknown Gemini API error", 300),
       });
 
-      throw new Error(
-        `Gemini API error: ${response.status}`
-      );
+      if (response.status === 429) throw new Error("QUOTA");
+      if (response.status === 401 || response.status === 403) throw new Error("KEY");
+      if (response.status === 404) throw new Error("MODEL");
+      throw new Error("REQUEST");
     }
 
-    const answer = data?.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text || "")
+    const candidate = data?.candidates?.[0];
+    const answer = (candidate?.content?.parts || [])
+      .map((part) => part.text || "")
       .join("")
       .trim();
 
     if (!answer) {
-      throw new Error("Gemini returned an empty response");
+      if (data?.promptFeedback?.blockReason) throw new Error("BLOCKED");
+      throw new Error("EMPTY");
     }
 
     log("gemini_completed", {
       durationMs: elapsed(startedAt),
       answerLength: answer.length,
       model: GEMINI_MODEL,
+      finishReason: candidate?.finishReason || "",
     });
 
     return answer;
   } catch (error) {
+    if (error.name === "AbortError") {
+      log("gemini_failed", { durationMs: elapsed(startedAt), error: "timeout" });
+      throw new Error("TIMEOUT");
+    }
     log("gemini_failed", {
       durationMs: elapsed(startedAt),
-      error:
-        error.name === "AbortError"
-          ? "timeout"
-          : String(error.message || error),
+      error: String(error.message || error),
     });
-
     throw error;
   }
 }
@@ -318,49 +305,50 @@ ${searchResults
 function buildHistory(history, userText, answer) {
   return [
     ...history,
-    {
-      role: "user",
-      text: truncate(userText, 2000),
-    },
-    {
-      role: "model",
-      text: truncate(answer, 2000),
-    },
+    { role: "user", text: truncate(userText, 1200) },
+    { role: "model", text: truncate(answer, 1200) },
   ].slice(-MAX_HISTORY_MESSAGES);
 }
 
-function aliceResponse(body, text, history = []) {
-  const session = body?.session || {};
-
+function aliceResponse(body, text, history = [], endSession = false) {
   return {
     version: body?.version || "1.0",
-    session,
+    session: body?.session || {},
     response: {
       text: truncate(text, MAX_ANSWER_LENGTH),
-      end_session: false,
+      end_session: endSession,
     },
-    session_state: {
-      history,
-    },
+    session_state: { history },
   };
 }
 
-function getFallbackText() {
-  return "Не успел подготовить ответ. Попробуй задать вопрос ещё раз.";
+function errorText(error) {
+  switch (error?.message) {
+    case "TIMEOUT":
+      return "Ответ не уложился в отведённое время. Попробуй спросить ещё раз.";
+    case "QUOTA":
+      return "Сейчас превышен лимит запросов к Gemini. Попробуй чуть позже.";
+    case "KEY":
+    case "MISSING_KEY":
+      return "Не удалось подключиться к Gemini. Проверьте ключ GEMINI_API_KEY в настройках Vercel.";
+    case "MODEL":
+      return "Модель Gemini не найдена. Проверьте переменную GEMINI_MODEL в настройках Vercel.";
+    case "BLOCKED":
+      return "Не получилось обработать этот запрос. Попробуй спросить иначе.";
+    default:
+      return "Не получилось получить ответ от нейросети. Попробуй ещё раз.";
+  }
 }
 
 export default async function handler(req, res) {
   const startedAt = Date.now();
 
-  // Алиса может проверять доступность endpoint через GET.
   if (req.method === "GET") {
     return res.status(200).send("Alice webhook is running");
   }
 
   if (req.method !== "POST") {
-    return res.status(405).json({
-      error: "Method not allowed",
-    });
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   const body = req.body || {};
@@ -368,18 +356,20 @@ export default async function handler(req, res) {
   const history = getHistory(body);
 
   if (!userText) {
-    return res.status(200).json(
-      aliceResponse(
-        body,
-        "Привет! Что хочешь узнать?",
-        history
-      )
-    );
+    return res
+      .status(200)
+      .json(aliceResponse(body, "Привет! Я Gemini. Что хочешь узнать?", history));
+  }
+
+  if (isExitIntent(userText)) {
+    return res
+      .status(200)
+      .json(aliceResponse(body, "Хорошо, до встречи!", [], true));
   }
 
   try {
     const needsSearch = isSearchNeeded(userText);
-    let searchResults = [];
+    let searchContext = "";
 
     log("request_started", {
       queryLength: userText.length,
@@ -387,64 +377,42 @@ export default async function handler(req, res) {
       historyCount: history.length,
     });
 
-    // Обычные вопросы не тратят время на Serper.
     if (needsSearch && SERPER_API_KEY) {
       const searchBudget = Math.min(
         SERPER_TIMEOUT_MS,
-        Math.max(0, remainingTime(startedAt) - 500)
+        remainingTime(startedAt) - MIN_MODEL_TIME_MS
       );
 
-      if (searchBudget >= 150) {
-        searchResults = await searchSerper(
-          userText,
-          searchBudget
-        );
+      if (searchBudget >= 300) {
+        searchContext = await searchSerper(userText, searchBudget);
       }
+      if (!searchContext) searchContext = NO_SEARCH_NOTE;
     }
 
-    const modelBudget = Math.min(
-      MODEL_TIMEOUT_MS,
-      remainingTime(startedAt)
-    );
+    const modelBudget = Math.min(MODEL_TIMEOUT_MS, remainingTime(startedAt));
+    if (modelBudget < 500) throw new Error("TIMEOUT");
 
-    if (modelBudget < 500) {
-      throw new Error("TIME_BUDGET_EXHAUSTED");
-    }
-
-    const answer = await askGemini(
-      userText,
-      history,
-      searchResults,
-      modelBudget
-    );
-
-    const updatedHistory = buildHistory(
-      history,
-      userText,
-      answer
-    );
+    const answer = await askGemini(userText, history, searchContext, modelBudget);
 
     log("request_completed", {
       durationMs: elapsed(startedAt),
       searched: needsSearch,
-      resultsCount: searchResults.length,
+      hadSearchResults: Boolean(searchContext) && searchContext !== NO_SEARCH_NOTE,
     });
 
-    return res.status(200).json(
-      aliceResponse(body, answer, updatedHistory)
-    );
+    return res
+      .status(200)
+      .json(aliceResponse(body, answer, buildHistory(history, userText, answer)));
   } catch (error) {
     log("request_fallback", {
       durationMs: elapsed(startedAt),
       error: String(error.message || error),
     });
 
-    return res.status(200).json(
-      aliceResponse(
-        body,
-        getFallbackText(),
-        history
-      )
-    );
+    return res
+      .status(200)
+      .json(aliceResponse(body, errorText(error), history));
   }
 }
+
+// END OF FILE
