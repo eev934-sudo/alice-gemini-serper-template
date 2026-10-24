@@ -1,12 +1,12 @@
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
 const DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5";
-const MAX_HISTORY_MESSAGES = 4;
+const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 800;
-const MODEL_TIMEOUT_MS = 2800;
+const SERPER_TIMEOUT_MS = 1000;
+const MODEL_TIMEOUT_MS = 2500;
 const GROUNDED_MODEL_TIMEOUT_MS = 3300;
 
 function providerInfo() {
@@ -47,7 +47,6 @@ function buildSystemPrompt() {
     "Твой ответ показывается и озвучивается в навыке Яндекс Алисы, поэтому отвечай по-русски, кратко и так, чтобы ответ было удобно слушать.",
     "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления. Не называй ссылки и адреса сайтов.",
     "Если вопрос требует актуальных данных и есть результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-    "Никогда не утверждай, что событие не происходило, только потому что ты о нём не знаешь или поиск ничего не дал: твои знания устарели. Если результатов поиска нет или они не подтверждают событие, скажи, что в найденном подтверждения нет, но это не значит, что события не было. Если пользователь говорит, что нашёл новость, не спорь, а прими это как данные и уточни детали.",
     "Не придумывай ограничений: не говори, что сайт или сервис заблокирован в России или недоступен из-за региона, если этого нет в результатах поиска.",
     "Не начинай ответ с оговорок о том, что ты не можешь открывать сайты или приложения. Просто ответь по результатам поиска и своим знаниям. Если точных данных нет, назови то, что нашлось, с пометкой, что данные могут быть неточными, и коротко скажи, чего не хватило.",
     "На новостные и спорные темы отвечай по существу и нейтрально, опираясь на результаты поиска, если они есть.",
@@ -116,66 +115,45 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function serperQuery(endpoint, query, timeoutMs, extra = {}) {
+async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
+  if (!key || timeoutMs < 150) return "";
+
   try {
     const { response, data } = await fetchJson(
-      `https://google.serper.dev/${endpoint}`,
+      "https://google.serper.dev/search",
       {
         method: "POST",
         headers: {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, hl: "ru", num: 5, ...extra })
+        body: JSON.stringify({ q: query, hl: "ru", num: 5 })
       },
-      timeoutMs
+      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
+
     if (!response.ok) {
-      console.warn("Serper", endpoint, "failed with HTTP", response.status);
-      return null;
+      console.warn("Serper request failed with HTTP", response.status);
+      return "";
     }
-    return data;
+
+    const items = (Array.isArray(data.organic) ? data.organic : [])
+      .slice(0, 5)
+      .map((item, i) => {
+        const title = String(item.title || "").slice(0, 180);
+        const snippet = String(item.snippet || "").slice(0, 350);
+        const link = String(item.link || "").slice(0, 240);
+        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
+      });
+
+    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
+    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
+    return items.length ? items.join("\n") : "";
   } catch (error) {
-    return null;
-  }
-}
-
-async function searchWeb(query, timeoutMs) {
-  const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
-
-  const budget = Math.min(SERPER_TIMEOUT_MS, timeoutMs);
-  const [web, news] = await Promise.all([
-    serperQuery("search", query, budget),
-    serperQuery("news", query, budget, { tbs: "qdr:w" })
-  ]);
-
-  if (!web && !news) {
     console.warn("Serper request did not finish in time; continuing without search.");
     return "";
   }
-
-  const lines = [];
-
-  const answerBox = web?.answerBox?.answer || web?.answerBox?.snippet;
-  if (answerBox) lines.push(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
-
-  (Array.isArray(news?.news) ? news.news : []).slice(0, 4).forEach(item => {
-    const title = String(item.title || "").slice(0, 180);
-    const snippet = String(item.snippet || "").slice(0, 250);
-    const source = String(item.source || "").slice(0, 60);
-    const date = String(item.date || "").slice(0, 40);
-    lines.push(`Новость (${source}, ${date}): ${title}. ${snippet}`.trim());
-  });
-
-  (Array.isArray(web?.organic) ? web.organic : []).slice(0, 4).forEach(item => {
-    const title = String(item.title || "").slice(0, 180);
-    const snippet = String(item.snippet || "").slice(0, 300);
-    lines.push(`${title}: ${snippet}`.trim());
-  });
-
-  return lines.join("\n");
 }
 
 function buildPrompt(text, searchContext) {
@@ -332,7 +310,7 @@ async function askGemini(text, history, searchContext, timeoutMs, grounding = fa
     contents,
     generationConfig: {
       temperature: 0.5,
-      maxOutputTokens: grounding ? 320 : 200
+      maxOutputTokens: grounding ? 320 : 240
     }
   };
   if (grounding) requestBody.tools = [{ google_search: {} }];
@@ -443,12 +421,9 @@ export default async function handler(req, res) {
 
     if (wantsSearch && !useGrounding && process.env.SERPER_API_KEY) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
-      if (!searchContext) {
-        searchContext = "ПОИСК НЕ ДАЛ РЕЗУЛЬТАТОВ ИЛИ НЕ УСПЕЛ ОТВЕТИТЬ. Свежих данных нет, отвечай осторожно и не отрицай события.";
-      }
     }
 
-    const reserveMs = 300;
+    const reserveMs = useGrounding ? 300 : 600;
     const limitMs = useGrounding ? GROUNDED_MODEL_TIMEOUT_MS : MODEL_TIMEOUT_MS;
     const timeoutMs = Math.max(0, Math.min(limitMs, remainingMs() - reserveMs));
 
