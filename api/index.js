@@ -1,12 +1,12 @@
 const DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite";
 const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
 const DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5";
-const MAX_HISTORY_MESSAGES = 8;
+const MAX_HISTORY_MESSAGES = 4;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 1000;
-const MODEL_TIMEOUT_MS = 2500;
+const SERPER_TIMEOUT_MS = 800;
+const MODEL_TIMEOUT_MS = 2800;
 const GROUNDED_MODEL_TIMEOUT_MS = 3300;
 
 function providerInfo() {
@@ -116,45 +116,66 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
+async function serperQuery(endpoint, query, timeoutMs, extra = {}) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
-
   try {
     const { response, data } = await fetchJson(
-      "https://google.serper.dev/search",
+      `https://google.serper.dev/${endpoint}`,
       {
         method: "POST",
         headers: {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, hl: "ru", num: 5 })
+        body: JSON.stringify({ q: query, hl: "ru", num: 5, ...extra })
       },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+      timeoutMs
     );
-
     if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
+      console.warn("Serper", endpoint, "failed with HTTP", response.status);
+      return null;
     }
-
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 5)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
-
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
-    return items.length ? items.join("\n") : "";
+    return data;
   } catch (error) {
+    return null;
+  }
+}
+
+async function searchWeb(query, timeoutMs) {
+  const key = process.env.SERPER_API_KEY;
+  if (!key || timeoutMs < 150) return "";
+
+  const budget = Math.min(SERPER_TIMEOUT_MS, timeoutMs);
+  const [web, news] = await Promise.all([
+    serperQuery("search", query, budget),
+    serperQuery("news", query, budget, { tbs: "qdr:w" })
+  ]);
+
+  if (!web && !news) {
     console.warn("Serper request did not finish in time; continuing without search.");
     return "";
   }
+
+  const lines = [];
+
+  const answerBox = web?.answerBox?.answer || web?.answerBox?.snippet;
+  if (answerBox) lines.push(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
+
+  (Array.isArray(news?.news) ? news.news : []).slice(0, 4).forEach(item => {
+    const title = String(item.title || "").slice(0, 180);
+    const snippet = String(item.snippet || "").slice(0, 250);
+    const source = String(item.source || "").slice(0, 60);
+    const date = String(item.date || "").slice(0, 40);
+    lines.push(`Новость (${source}, ${date}): ${title}. ${snippet}`.trim());
+  });
+
+  (Array.isArray(web?.organic) ? web.organic : []).slice(0, 4).forEach(item => {
+    const title = String(item.title || "").slice(0, 180);
+    const snippet = String(item.snippet || "").slice(0, 300);
+    lines.push(`${title}: ${snippet}`.trim());
+  });
+
+  return lines.join("\n");
 }
 
 function buildPrompt(text, searchContext) {
@@ -311,7 +332,7 @@ async function askGemini(text, history, searchContext, timeoutMs, grounding = fa
     contents,
     generationConfig: {
       temperature: 0.5,
-      maxOutputTokens: grounding ? 320 : 240
+      maxOutputTokens: grounding ? 320 : 200
     }
   };
   if (grounding) requestBody.tools = [{ google_search: {} }];
@@ -427,7 +448,7 @@ export default async function handler(req, res) {
       }
     }
 
-    const reserveMs = useGrounding ? 300 : 600;
+    const reserveMs = 300;
     const limitMs = useGrounding ? GROUNDED_MODEL_TIMEOUT_MS : MODEL_TIMEOUT_MS;
     const timeoutMs = Math.max(0, Math.min(limitMs, remainingMs() - reserveMs));
 
